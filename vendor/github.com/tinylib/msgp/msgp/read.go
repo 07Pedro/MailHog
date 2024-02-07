@@ -36,6 +36,7 @@ const (
 	IntType
 	UintType
 	NilType
+	DurationType
 	ExtensionType
 
 	// pseudo-types provided
@@ -126,6 +127,11 @@ func NewReaderSize(r io.Reader, sz int) *Reader {
 	return &Reader{R: fwd.NewReaderSize(r, sz)}
 }
 
+// NewReaderBuf returns a *Reader with a provided buffer.
+func NewReaderBuf(r io.Reader, buf []byte) *Reader {
+	return &Reader{R: fwd.NewReaderBuf(r, buf)}
+}
+
 // Reader wraps an io.Reader and provides
 // methods to read MessagePack-encoded values
 // from it. Readers are buffered.
@@ -144,6 +150,56 @@ type Reader struct {
 // Read implements `io.Reader`
 func (m *Reader) Read(p []byte) (int, error) {
 	return m.R.Read(p)
+}
+
+// CopyNext reads the next object from m without decoding it and writes it to w.
+// It avoids unnecessary copies internally.
+func (m *Reader) CopyNext(w io.Writer) (int64, error) {
+	sz, o, err := getNextSize(m.R)
+	if err != nil {
+		return 0, err
+	}
+
+	var n int64
+	// Opportunistic optimization: if we can fit the whole thing in the m.R
+	// buffer, then just get a pointer to that, and pass it to w.Write,
+	// avoiding an allocation.
+	if int(sz) <= m.R.BufferSize() {
+		var nn int
+		var buf []byte
+		buf, err = m.R.Next(int(sz))
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				err = ErrShortBytes
+			}
+			return 0, err
+		}
+		nn, err = w.Write(buf)
+		n += int64(nn)
+	} else {
+		// Fall back to io.CopyN.
+		// May avoid allocating if w is a ReaderFrom (e.g. bytes.Buffer)
+		n, err = io.CopyN(w, m.R, int64(sz))
+		if err == io.ErrUnexpectedEOF {
+			err = ErrShortBytes
+		}
+	}
+	if err != nil {
+		return n, err
+	} else if n < int64(sz) {
+		return n, io.ErrShortWrite
+	}
+
+	// for maps and slices, read elements
+	for x := uintptr(0); x < o; x++ {
+		var n2 int64
+		n2, err = m.CopyNext(w)
+		if err != nil {
+			return n, err
+		}
+		n += n2
+	}
+	return n, nil
 }
 
 // ReadFull implements `io.ReadFull`
@@ -194,8 +250,10 @@ func (m *Reader) IsNil() bool {
 	return err == nil && p[0] == mnil
 }
 
+// getNextSize returns the size of the next object on the wire.
 // returns (obj size, obj elements, error)
 // only maps and arrays have non-zero obj elements
+// for maps and arrays, obj size does not include elements
 //
 // use uintptr b/c it's guaranteed to be large enough
 // to hold whatever we can fit in memory.
@@ -205,7 +263,7 @@ func getNextSize(r *fwd.Reader) (uintptr, uintptr, error) {
 		return 0, 0, err
 	}
 	lead := b[0]
-	spec := &sizes[lead]
+	spec := getBytespec(lead)
 	size, mode := spec.size, spec.extra
 	if size == 0 {
 		return 0, 0, InvalidPrefixError(lead)
@@ -337,7 +395,7 @@ func (m *Reader) ReadMapKey(scratch []byte) ([]byte, error) {
 	return out, nil
 }
 
-// MapKeyPtr returns a []byte pointing to the contents
+// ReadMapKeyPtr returns a []byte pointing to the contents
 // of a valid map key. The key cannot be empty, and it
 // must be shorter than the total buffer size of the
 // *Reader. Additionally, the returned slice is only
@@ -502,6 +560,12 @@ func (m *Reader) ReadBool() (b bool, err error) {
 	return
 }
 
+// ReadDuration reads a time.Duration from the reader
+func (m *Reader) ReadDuration() (d time.Duration, err error) {
+	i, err := m.ReadInt64()
+	return time.Duration(i), err
+}
+
 // ReadInt64 reads an int64 from the reader
 func (m *Reader) ReadInt64() (i int64, err error) {
 	var p []byte
@@ -531,12 +595,28 @@ func (m *Reader) ReadInt64() (i int64, err error) {
 		i = int64(getMint8(p))
 		return
 
+	case muint8:
+		p, err = m.R.Next(2)
+		if err != nil {
+			return
+		}
+		i = int64(getMuint8(p))
+		return
+
 	case mint16:
 		p, err = m.R.Next(3)
 		if err != nil {
 			return
 		}
 		i = int64(getMint16(p))
+		return
+
+	case muint16:
+		p, err = m.R.Next(3)
+		if err != nil {
+			return
+		}
+		i = int64(getMuint16(p))
 		return
 
 	case mint32:
@@ -547,12 +627,33 @@ func (m *Reader) ReadInt64() (i int64, err error) {
 		i = int64(getMint32(p))
 		return
 
+	case muint32:
+		p, err = m.R.Next(5)
+		if err != nil {
+			return
+		}
+		i = int64(getMuint32(p))
+		return
+
 	case mint64:
 		p, err = m.R.Next(9)
 		if err != nil {
 			return
 		}
 		i = getMint64(p)
+		return
+
+	case muint64:
+		p, err = m.R.Next(9)
+		if err != nil {
+			return
+		}
+		u := getMuint64(p)
+		if u > math.MaxInt64 {
+			err = UintOverflow{Value: u, FailedBitsize: 64}
+			return
+		}
+		i = int64(u)
 		return
 
 	default:
@@ -626,12 +727,38 @@ func (m *Reader) ReadUint64() (u uint64, err error) {
 		return
 	}
 	switch lead {
+	case mint8:
+		p, err = m.R.Next(2)
+		if err != nil {
+			return
+		}
+		v := int64(getMint8(p))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		return
+
 	case muint8:
 		p, err = m.R.Next(2)
 		if err != nil {
 			return
 		}
 		u = uint64(getMuint8(p))
+		return
+
+	case mint16:
+		p, err = m.R.Next(3)
+		if err != nil {
+			return
+		}
+		v := int64(getMint16(p))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
 		return
 
 	case muint16:
@@ -642,12 +769,38 @@ func (m *Reader) ReadUint64() (u uint64, err error) {
 		u = uint64(getMuint16(p))
 		return
 
+	case mint32:
+		p, err = m.R.Next(5)
+		if err != nil {
+			return
+		}
+		v := int64(getMint32(p))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		return
+
 	case muint32:
 		p, err = m.R.Next(5)
 		if err != nil {
 			return
 		}
 		u = uint64(getMuint32(p))
+		return
+
+	case mint64:
+		p, err = m.R.Next(9)
+		if err != nil {
+			return
+		}
+		v := int64(getMint64(p))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
 		return
 
 	case muint64:
@@ -659,7 +812,11 @@ func (m *Reader) ReadUint64() (u uint64, err error) {
 		return
 
 	default:
-		err = badPrefix(UintType, lead)
+		if isnfixint(lead) {
+			err = UintBelowZero{Value: int64(rnfixint(lead))}
+		} else {
+			err = badPrefix(UintType, lead)
+		}
 		return
 
 	}
@@ -1150,6 +1307,10 @@ func (m *Reader) ReadIntf() (i interface{}, err error) {
 
 	case TimeType:
 		i, err = m.ReadTime()
+		return
+
+	case DurationType:
+		i, err = m.ReadDuration()
 		return
 
 	case ExtensionType:
