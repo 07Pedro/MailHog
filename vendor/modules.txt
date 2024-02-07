@@ -1,8 +1,6 @@
-# github.com/07Pedro/MailHog-Server v0.0.0-20240207123617-53ea3e7d967f
+# github.com/07Pedro/MailHog-Server v0.0.0-20240207143234-98523ca79147
 ## explicit
 github.com/07Pedro/MailHog-Server/api
-github.com/07Pedro/MailHog-Server/config
-github.com/07Pedro/MailHog-Server/smtp
 # github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869
 ## explicit
 # github.com/gorilla/context v1.1.2
@@ -42,6 +40,7 @@ github.com/mailhog/MailHog/config
 ## explicit
 github.com/mailhog/MailHog-Server/config
 github.com/mailhog/MailHog-Server/monkey
+github.com/mailhog/MailHog-Server/smtp
 github.com/mailhog/MailHog-Server/websockets
 # github.com/mailhog/MailHog-UI v1.0.1
 ## explicit
