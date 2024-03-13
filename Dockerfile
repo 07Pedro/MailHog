@@ -9,6 +9,7 @@ RUN apk --no-cache add --virtual build-dependencies \
     git \
   && mkdir -p /root/gocode \
   && export GOPATH=/root/gocode \
+  && pwd \
   && go install github.com/07Pedro/MailHog@latest
 
 FROM alpine:3
